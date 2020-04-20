@@ -1,0 +1,279 @@
+---
+title: "Does Height Matter for Presidential Candidates?"
+author: "Will Schrepferman"
+date: "4/19/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(rvest)
+library(xml2)
+library(janitor)
+library(stringr)
+library(tm)
+library(skimr)
+library(gt)
+library(plotly)
+library(broom)
+```
+
+
+```{r read_data}
+height_url <- "https://en.wikipedia.org/wiki/Heights_of_presidents_and_presidential_candidates_of_the_United_States"
+
+height_rawdata <- height_url %>%
+  read_html() %>%
+  html_node(xpath = "/html/body/div[3]/div[3]/div[4]/div/table[5]") %>%
+  html_table()
+
+height_data <- height_rawdata %>%
+  
+  # reorganize variable names
+  
+  clean_names() %>%
+  mutate(year = election) %>%
+  mutate(winner = winnerin_electoral_college) %>%
+  mutate(winner_height_cm = height_2) %>%
+  mutate(loser = main_opponent_s_during_election) %>%
+  mutate(loser_height_cm = height_4) %>%
+  select(year, winner, winner_height_cm, loser, loser_height_cm)
+
+
+height_data <- height_data %>%
+  mutate(loser = str_replace_all(string = loser, pattern = "[[:punct:]]", "")) %>%
+  mutate(loser = removeNumbers(loser)) %>%
+  mutate(winner_height_cm = as.numeric(gsub("[^0-9.-]", "", winner_height_cm))) %>%
+  mutate(loser_height_cm = as.numeric(gsub("[^0-9.-]", "", loser_height_cm))) %>%
+  
+  # create column for diff. between winner and loser height
+  
+  mutate(height_difference = winner_height_cm - loser_height_cm)
+
+# remove elections that:
+# haven't happened yet, or
+# where there were more than two candidates, or
+# where there was only one candidate.
+
+height_data <- height_data[-c(1, 28, 41, 42, 47, 50, 51, 58, 59), ]
+
+
+
+election_url <- "https://en.wikipedia.org/wiki/List_of_United_States_presidential_elections_by_Electoral_College_margin"
+
+election_rawdata <- election_url %>%
+  read_html() %>%
+  html_node(xpath = "/html/body/div[3]/div[3]/div[4]/div/table[2]") %>%
+  html_table(fill = TRUE)
+
+election_rawdata <- election_rawdata[-c(1, 2, 3), ]
+
+
+election_data <- election_rawdata %>%
+  clean_names() %>%
+  arrange(year) %>%
+  mutate(total_electors = as.numeric(number_of_electors_voting)) %>%
+  mutate(winner_electors = as.numeric(number_of_electors_voting_2)) %>%
+  mutate(loser_electors = as.numeric(number_of_electors_voting_3)) %>%
+  select(year, normalized_victory_margin) %>%
+  mutate(normalized_victory_margin = as.numeric(gsub("[^0-9.-]", "", normalized_victory_margin)))
+
+comb_data <- height_data %>%
+  inner_join(election_data, by = "year")
+
+mean_winner_height <- comb_data %>%
+  summarize(mean_winner_height = mean(winner_height_cm)) %>%
+  pull()
+
+mean_loser_height <- comb_data %>%
+  summarize(mean_loser_height = mean(loser_height_cm, na.rm = T)) %>%
+  pull()
+
+mean_victory_margin <- comb_data %>%
+  summarize(mean_victory_margin = mean(normalized_victory_margin)) %>%
+  pull()
+
+comb_data <- comb_data %>%
+  mutate(taller_winners = case_when(height_difference > 0 ~ TRUE, height_difference <= 0 ~ FALSE))
+
+num_taller_winners <- comb_data %>%
+  filter(taller_winners == TRUE) %>%
+  summarize(num_taller_winners = n()) %>%
+  pull()
+
+num_taller_losers <- comb_data %>%
+  filter(taller_winners == FALSE) %>%
+  summarize(num_taller_losers = n()) %>%
+  pull()
+
+num_taller_winners_modern <- comb_data %>%
+  filter(as.numeric(year) >= 1900) %>%
+  filter(taller_winners == TRUE) %>%
+  summarize(num_taller_winners = n()) %>%
+  pull()
+
+num_taller_losers_modern <- comb_data %>%
+  filter(as.numeric(year) >= 1900) %>%
+  filter(taller_winners == FALSE) %>%
+  summarize(num_taller_losers = n()) %>%
+  pull()
+
+scatterplot <- comb_data %>%
+  na.omit() %>%
+  ggplot(aes(x = height_difference, y = normalized_victory_margin)) +
+  geom_point(aes(winner = winner, loser = loser, year = year)) +
+  stat_smooth(method = "lm")+
+  labs(title = "Relationship between Height Difference of\n Victorious Presidential Candidates\n and Their Normalized Victory Margin",
+       x = "Height Difference (cm)",
+       y = "Normalized Victory Margin") +
+  theme_minimal()
+
+interactive_plot <- ggplotly(scatterplot, tooltip = c("winner", "loser", "year"))
+
+model <- comb_data %>%
+  lm(formula = normalized_victory_margin ~ height_difference) %>%
+  tidy(conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high) %>%
+  gt() %>%
+  tab_header(title = "Regression Results", subtitle = "Bounds use 95% Confidence Interval") %>%
+  cols_label(term = "Variable", estimate = "Estimate", conf.low = "Lower Bound", conf.high = "Upper Bound")
+
+
+# get data into tidy format for candidate, height, total electoral votes
+
+winner_data <- comb_data %>%
+  mutate(loser_votes = (538 - (normalized_victory_margin*538))/2) %>%
+  mutate(winner_votes = (538 + (normalized_victory_margin*538))/2) %>%
+  
+  # need universal variable names for rbind
+  
+  mutate(candidate = winner, 
+         height = winner_height_cm,
+         votes = winner_votes) %>%
+  select(candidate, height, votes, year)
+
+loser_data <- comb_data %>%
+  mutate(loser_votes = (538 - (normalized_victory_margin*538))/2) %>%
+  mutate(winner_votes = (538 + (normalized_victory_margin*538))/2) %>%
+  mutate(candidate = loser, 
+         height = loser_height_cm,
+         votes = loser_votes) %>%
+  select(candidate, height, votes, year)
+
+tidy_data <- rbind(winner_data, loser_data) %>%
+  mutate(Result = case_when(votes > 270 ~ "winner", votes < 270 ~ "loser"))
+
+# fix how Hayes and Jefferson were mistakenly labelled
+
+tidy_data[35, 5] <- "winner"
+tidy_data[49, 5] <- "winner"
+
+
+scatterplot_all_cands <- tidy_data %>%
+  na.omit() %>%
+  ggplot(aes(x = height, y = votes)) +
+  geom_point(aes(candidate = candidate, year = year)) +
+  stat_smooth(method = "lm")+
+  labs(title = "Relationship between Height of Candidates\n and Normalized Electoral Votes",
+       x = "Height (cm)",
+       y = "Electoral Votes (scaled to 270)") +
+  theme_minimal()
+
+interactive_plot_all_cands <- ggplotly(scatterplot_all_cands, tooltip = c("candidate", "year"))
+
+model_all_cands <- tidy_data %>%
+  lm(formula = votes ~ height) %>%
+  tidy(conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high) %>%
+  gt() %>%
+  tab_header(title = "Regression Results", subtitle = "Bounds use 95% Confidence Interval") %>%
+  cols_label(term = "Variable", estimate = "Estimate", conf.low = "Lower Bound", conf.high = "Upper Bound")
+
+
+tidy_data_modern <- tidy_data %>%
+  filter(as.numeric(year) >= 1900)
+
+scatterplot_all_cands_modern <- tidy_data_modern %>%
+  na.omit() %>%
+  ggplot(aes(x = height, y = votes)) +
+  geom_point(aes(candidate = candidate, year = year)) +
+  stat_smooth(method = "lm")+
+  labs(title = "Relationship between Height of Modern Candidates\n and Normalized Electoral Votes",
+       x = "Height (cm)",
+       y = "Electoral Votes (scaled to 270)") +
+  theme_minimal()
+
+interactive_plot_all_cands_modern <- ggplotly(scatterplot_all_cands_modern, tooltip = c("candidate", "year"))
+
+model_all_cands_modern <- tidy_data_modern %>%
+  lm(formula = votes ~ height) %>%
+  tidy(conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high) %>%
+  gt() %>%
+  tab_header(title = "Regression Results", subtitle = "Bounds use 95% Confidence Interval") %>%
+  cols_label(term = "Variable", estimate = "Estimate", conf.low = "Lower Bound", conf.high = "Upper Bound")
+
+
+```
+
+## Introduction
+
+Folk wisdom holds that taller presidential candidates perform better than their shorter counterparts. Using height and electoral results data from every election, I set out to examine that claim.
+
+## Methodology
+
+I used election data from this page: https://en.wikipedia.org/wiki/List_of_United_States_presidential_elections_by_Electoral_College_margin 
+
+And height data from this one: https://en.wikipedia.org/wiki/Heights_of_presidents_and_presidential_candidates_of_the_United_States 
+
+For height, I elected to use centimeters. I removed all data from elections in which there was only one major candidate or more than two major candidates in order to universally apply a binary winner/loser framework. All election data is scaled to the modern standard of 270 Electoral votes; I used the 'normalized victory margin' for each election- this simply means that this is the relative margin of victory for a given candidate under a 270-vote system. I also used normalized victory margin to determine how many electoral votes each candidate received.
+
+## Data
+
+Here is a look at the most recent five elections worth of data combined and cleaned from the two sources:
+
+```{r, include = TRUE}
+comb_data %>%
+  arrange(desc(as.numeric(year))) %>%
+  select(year, winner, winner_height_cm, loser, loser_height_cm, normalized_victory_margin) %>%
+  head(5) %>%
+  gt() %>%
+  cols_label(year = "Year", winner = "Winner", winner_height_cm = "Winner Height (cm)", loser = "Loser", loser_height_cm = "Loser Height (cm)", normalized_victory_margin = "Normalized Victory Margin")
+```
+
+## Results
+
+An analysis of the complete data demonstrates that, for all elections, the taller candidate won  **`r num_taller_winners`** times, and the shorter won **`r num_taller_losers`** times. Not super conclusive.
+
+However, filtering for only modern elections (post-1900) yields more interesting results. Widespread mass media in the modern age and increased suffrage meant that voters had more exposure to candidates and more direct influence over the election. In modern elections, the taller candidate won **`r num_taller_winners_modern`** times and the shorter won **`r num_taller_losers_modern`**.
+
+Next, I took a more formal look at how height relates to electoral success (in the form of electoral votes). Here are the scatterplot and regression results  (you can hover over a data point to see specifics):
+
+```{r, include = TRUE}
+interactive_plot_all_cands
+model_all_cands
+```
+
+The relationship exists, but it is slightly weak. It becomes stronger when only using modern candidates like we did before:
+
+```{r, include = TRUE}
+interactive_plot_all_cands_modern
+model_all_cands_modern
+```
+
+Finally, I wanted to examine if increased height differences yielded stronger victory margins (ie if, for winning candidates, a greater height difference resulted in larger victories). Here is the plot of height difference and victory margin with regression results displayed beneath:
+```{r, include = TRUE}
+interactive_plot
+model
+```
+
+There is a relatively robust positive relationship between height difference and victory margin.
+
+## Conclusion
+
+The idea that taller candidates win more often seems to hold some water. Obviously, there are plenty of possible confounding variables, but taller candidates win more frequently than shorter ones, especially in modern times. On the whole, the relationship between height and electoral success is positive for candidates (again, especially modern ones). Additionally, a greater height difference implies a stronger electoral victory. Folk wisdom isn't totally wrong!
+
+
