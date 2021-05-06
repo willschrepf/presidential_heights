@@ -1,2 +1,2 @@
 # presidential_heights
-Statistical analysis of how height factors into presidential elections
+Statistical analysis the folk wisdom that height factors into presidential elections
